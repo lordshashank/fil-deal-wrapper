@@ -15,9 +15,17 @@ import {Misc} from "lib/filecoin-solidity/contracts/v0.8/utils/Misc.sol";
 import {FilAddresses} from "lib/filecoin-solidity/contracts/v0.8/utils/FilAddresses.sol";
 import {Strings} from "lib/openzeppelin-contracts/contracts/utils/Strings.sol";
 import {Ownable} from "lib/openzeppelin-contracts/contracts/access/Ownable.sol";
-import {IERC20} from "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {AccountAPI} from "lib/filecoin-solidity/contracts/v0.8/AccountAPI.sol";
+import {FilForwarder} from "./FilForwarder.sol";
+import {PythPriceFeed} from "./PythPriceFeed.sol";
 
+// Contracts
+
+/**
+ * @title MarketDealWrapper
+ * @dev A contract to manage Filecoin deals and automate payments to Storage Providers.
+ */
+contract MarketDealWrapper is Ownable {
 // Events
 event DealNotify(
     uint64 dealId,
@@ -29,16 +37,6 @@ event DealNotify(
 event ReceivedDataCap(string received);
 event AddressWhitelisted(address indexed account);
 event AddressRemovedFromWhitelist(address indexed account);
-event StorageProviderAdded(
-    uint64 indexed actorId,
-    address indexed ethAddr,
-    uint256 pricePerBytePerEpoch
-);
-event StorageProviderUpdated(
-    uint64 indexed actorId,
-    address indexed ethAddr,
-    uint256 pricePerBytePerEpoch
-);
 event FundsAdded(address indexed owner, uint256 amount);
 event FundsWithdrawn(address indexed owner, uint256 amount);
 event SpPaymentCreated(uint64 indexed dealId, uint256 total);
@@ -47,23 +45,12 @@ event SpPaymentWithdrawn(
     address indexed sp,
     uint256 amount
 );
-event FundsAddedToken(
-    address indexed owner,
-    address indexed token,
-    uint256 amount
-);
-event FundsWithdrawnToken(
-    address indexed owner,
-    address indexed token,
-    uint256 amount
-);
-event SpPaymentWithdrawnToken(
-    address indexed sp,
-    address indexed token,
-    uint256 amount
-);
 event ActorIdWhitelisted(uint64 actorId);
 event ActorIdRemovedFromWhitelist(uint64 actorId);
+event StorageProviderWhitelisted(uint64 indexed actorId, bytes providerAddr);
+event StorageProviderRemovedFromWhitelist(uint64 indexed actorId, bytes providerAddr);
+event PriceTierUpdated(uint256 highPrice_perBytePerEpoch, uint256 midPrice_perBytePerEpoch, uint256 lowPrice_perBytePerEpoch);
+event PriceThresholdUpdated(uint256 highThreshold, uint256 lowThreshold, uint32 decimals);
 
 // Errors
 error UnauthorizedMarketActor();
@@ -72,43 +59,45 @@ error UnauthorizedMethod();
 error InvalidSignature();
 error UnauthorizedSender();
 error InsufficientBalance();
-error ApprovalFailed();
 error TransferFailed();
 error NoFundsToClaim();
 error ContractBalanceTooLow();
-error NotStorageProvider();
 error InvalidAsciiByte();
 error InvalidAsciiHexLength();
+error UnauthorizedProvider();
+error InvalidDealState();
+error ForwardFailed();
 
 // Libraries
 using CBOR for CBOR.CBORBuffer;
-
-// Contracts
-
-/**
- * @title MarketDealWrapper
- * @dev A contract to manage Filecoin deals and automate payments to Storage Providers.
- */
-contract MarketDealWrapper is Ownable {
     using AccountCBOR for *;
     using MarketCBOR for *;
 
     // Type Declarations
-    struct StorageProvider {
-        uint64 actorId;
-        address ethAddr;
-        IERC20 token;
-        uint256 pricePerBytePerEpoch;
+    struct SpPayment {
+        uint256 totalAccrued;     // Total amount accrued to SP across all deals
+        uint256 totalWithdrawn;   // Total amount withdrawn by SP
+        uint256 nextCalcEpoch;    // Next epoch to calculate payment from
     }
 
-    struct DealPayment {
-        uint256 pricePerEpoch;
-        uint256 withdrawn;
-        IERC20 token;
-        address sp;
-        uint256 startEpoch;
-        uint256 endEpoch;
+    // Price tier structure for flexible pricing
+    struct PriceTier {
+        uint256 highTierPrice_perBytePerEpoch;    // Highest price tier (in wei per byte per epoch)
+        uint256 midTierPrice_perBytePerEpoch;     // Middle price tier (in wei per byte per epoch)
+        uint256 lowTierPrice_perBytePerEpoch;     // Lowest price tier (in wei per byte per epoch)
     }
+
+    // Price threshold structure for flexible price tiers
+    struct PriceThreshold {
+        uint256 highThreshold;    // High threshold for FIL price (in USD with precision)
+        uint256 lowThreshold;     // Low threshold for FIL price (in USD with precision)
+        uint32 decimals;           // Decimals for price representation (e.g., -8 for 8 decimal places)
+    }
+
+    // Constants used for timing calculations (not for pricing)
+    uint256 public constant EPOCHS_PER_DAY = 2880; // 86400 seconds / 30 seconds per epoch
+    uint256 public constant FIL_PRICE_MAX_AGE = 600; // 10 minutes (600 seconds)
+    uint32 public constant FIL_PRICE_DECIMALS = 18; // 18 decimal places for FIL price
 
     // State Variables
     uint64 public constant AUTHENTICATE_MESSAGE_METHOD_NUM = 2643134072;
@@ -119,12 +108,23 @@ contract MarketDealWrapper is Ownable {
     address public constant DATACAP_ACTOR_ETH_ADDRESS =
         address(0xfF00000000000000000000000000000000000007);
 
-    mapping(bytes => StorageProvider) public storageProviders;
+
     mapping(uint64 => bool) public isWhitelisted;
-    mapping(uint64 => DealPayment) public dealPayments;
+    mapping(bytes => bool) public isStorageProviderWhitelisted;  // New SP whitelist using FilAddress bytes
+    mapping(bytes => uint64[]) public spToDealIds;  // Using FilAddress bytes
     mapping(address => uint256) public ownerDeposits;
-    mapping(address => mapping(IERC20 => uint256)) public ownerTokenDeposits;
-    mapping(address => uint64[]) public spToDealIds;
+    mapping(bytes => SpPayment) public spPayments;  // SP FilAddress bytes -> payment data
+
+    // Add state variable
+    FilForwarder public filForwarder;
+
+    // Pyth integration
+    PythPriceFeed public priceFeed;
+    uint256 public pythUpdateFee;
+
+    // Price configuration with structs
+    PriceTier public priceTier;
+    PriceThreshold public priceThreshold;
 
     // Modifiers
     /**
@@ -143,7 +143,25 @@ contract MarketDealWrapper is Ownable {
      * @notice Constructor initializes the contract with the deployer as the owner.
      * @dev Inherits Ownable with msg.sender as the owner.
      */
-    constructor() Ownable(msg.sender) {}
+    constructor() Ownable(msg.sender) {
+        filForwarder = new FilForwarder();
+        priceFeed = new PythPriceFeed();
+        pythUpdateFee = 1e16; // 0.01 ETH, adjust as needed for Pyth network fees
+        
+        // Initialize price tier struct with values already in per byte per epoch
+        priceTier = PriceTier({
+            highTierPrice_perBytePerEpoch: 21,    // $0.067/TiB/day converted to per byte per epoch
+            midTierPrice_perBytePerEpoch: 10,     // $0.033/TiB/day converted to per byte per epoch
+            lowTierPrice_perBytePerEpoch: 0       // $0.000/TiB/day
+        });
+        
+        // Initialize price threshold struct
+        priceThreshold = PriceThreshold({
+            highThreshold: 2000000000,  // $20.00 with 8 decimal precision
+            lowThreshold: 800000000,    // $8.00 with 8 decimal precision
+            decimals: 8                // 8 decimal places
+        });
+    }
 
 
     /**
@@ -162,6 +180,36 @@ contract MarketDealWrapper is Ownable {
     function removeFromWhitelist(uint64 _actorId) external onlyOwner {
         isWhitelisted[_actorId] = false;
         emit ActorIdRemovedFromWhitelist(_actorId);
+    }
+
+    /**
+     * @notice Adds a Storage Provider to the whitelist
+     * @param actorId The actor ID of the Storage Provider
+     */
+    function addStorageProvider(uint64 actorId) external onlyOwner {
+        CommonTypes.FilAddress memory providerAddr = FilAddresses.fromActorID(actorId);
+        isStorageProviderWhitelisted[providerAddr.data] = true;
+        emit StorageProviderWhitelisted(actorId, providerAddr.data);
+    }
+
+    /**
+     * @notice Removes a Storage Provider from the whitelist
+     * @param actorId The actor ID of the Storage Provider
+     */
+    function removeStorageProvider(uint64 actorId) external onlyOwner {
+        CommonTypes.FilAddress memory providerAddr = FilAddresses.fromActorID(actorId);
+        isStorageProviderWhitelisted[providerAddr.data] = false;
+        emit StorageProviderRemovedFromWhitelist(actorId, providerAddr.data);
+    }
+
+    /**
+     * @notice Check if a Storage Provider is whitelisted
+     * @param actorId The actor ID of the Storage Provider
+     * @return bool True if the Storage Provider is whitelisted, false otherwise
+     */
+    function isSpWhitelisted(uint64 actorId) external view returns (bool) {
+        CommonTypes.FilAddress memory providerAddr = FilAddresses.fromActorID(actorId);
+        return isStorageProviderWhitelisted[providerAddr.data];
     }
 
     /**
@@ -210,6 +258,11 @@ contract MarketDealWrapper is Ownable {
         if (!isWhitelisted[actorId]) {
             revert UnauthorizedSender();
         }
+
+        // Check if provider is whitelisted
+        if (!isStorageProviderWhitelisted[proposal.provider.data]) {
+            revert UnauthorizedProvider();
+        }
     }
 
     /**
@@ -230,38 +283,21 @@ contract MarketDealWrapper is Ownable {
             .deserializeMarketDealNotifyParams(params);
         MarketTypes.DealProposal memory proposal = MarketCBOR
             .deserializeDealProposal(mdnp.dealProposal);
+        
+        // Track deal for the SP
+        spToDealIds[proposal.provider.data].push(mdnp.dealId);
 
-        int64 duration = CommonTypes.ChainEpoch.unwrap(proposal.end_epoch) -
-            CommonTypes.ChainEpoch.unwrap(proposal.start_epoch);
-
-        StorageProvider memory sp = storageProviders[proposal.provider.data];
-        // Revert if SP doesn't exist
-        if (sp.ethAddr == address(0)) {
-            revert UnauthorizedMarketActor();
+        // Initialize or update SP payment tracking
+        SpPayment storage spPayment = spPayments[proposal.provider.data];
+        uint256 startEpoch = uint256(
+            int256(CommonTypes.ChainEpoch.unwrap(proposal.start_epoch))
+        );
+        
+        // If this is the SP's first deal, initialize nextCalcEpoch
+        if (spPayment.nextCalcEpoch == 0) {
+            spPayment.nextCalcEpoch = startEpoch;
         }
 
-        // Calculate total payment
-        uint256 pricePerEpoch = uint256(proposal.piece_size) *
-            sp.pricePerBytePerEpoch;
-        uint256 totalPayment = pricePerEpoch * uint256(int256(duration));
-
-        dealPayments[mdnp.dealId] = DealPayment({
-            pricePerEpoch: pricePerEpoch,
-            withdrawn: 0,
-            token: sp.token,
-            sp: sp.ethAddr,
-            startEpoch: uint256(
-                int256(CommonTypes.ChainEpoch.unwrap(proposal.start_epoch))
-            ),
-            endEpoch: uint256(
-                int256(CommonTypes.ChainEpoch.unwrap(proposal.end_epoch))
-            )
-        });
-
-        // Track deal for the SP
-        spToDealIds[sp.ethAddr].push(mdnp.dealId);
-
-        emit SpPaymentCreated(mdnp.dealId, totalPayment);
         emit DealNotify(
             mdnp.dealId,
             proposal.piece_cid.data,
@@ -306,56 +342,6 @@ contract MarketDealWrapper is Ownable {
     }
 
     /**
-     * @notice Adds a new Storage Provider to the contract.
-     * @param actorId The actor ID of the Storage Provider.
-     * @param ethAddr The Ethereum address of the Storage Provider.
-     * @param token The ERC20 token used for payments.
-     * @param pricePerBytePerEpoch The price per byte per epoch.
-     */
-    function addStorageProvider(
-        uint64 actorId,
-        address ethAddr,
-        IERC20 token,
-        uint256 pricePerBytePerEpoch
-    ) external onlyOwner {
-        CommonTypes.FilAddress memory filAddr = FilAddresses.fromActorID(
-            actorId
-        );
-        storageProviders[filAddr.data] = StorageProvider(
-            actorId,
-            ethAddr,
-            token,
-            pricePerBytePerEpoch
-        );
-        emit StorageProviderAdded(actorId, ethAddr, pricePerBytePerEpoch);
-    }
-
-    /**
-     * @notice Updates an existing Storage Provider's details.
-     * @param actorId The actor ID of the Storage Provider.
-     * @param ethAddr The new Ethereum address of the Storage Provider.
-     * @param token The new ERC20 token used for payments.
-     * @param pricePerBytePerEpoch The new price per byte per epoch.
-     */
-    function updateStorageProvider(
-        uint64 actorId,
-        address ethAddr,
-        IERC20 token,
-        uint256 pricePerBytePerEpoch
-    ) external onlyOwner {
-        CommonTypes.FilAddress memory filAddr = FilAddresses.fromActorID(
-            actorId
-        );
-        storageProviders[filAddr.data] = StorageProvider(
-            actorId,
-            ethAddr,
-            token,
-            pricePerBytePerEpoch
-        );
-        emit StorageProviderUpdated(actorId, ethAddr, pricePerBytePerEpoch);
-    }
-
-    /**
      * @notice Adds native funds to the contract.
      * @dev Only the owner can add funds.
      */
@@ -382,41 +368,307 @@ contract MarketDealWrapper is Ownable {
     }
 
     /**
-     * @notice Adds ERC20 tokens to the contract.
-     * @param token The ERC20 token to add.
-     * @param amount The amount of tokens to add.
-     * @dev Only the owner can add ERC20 funds.
+     * @notice Set the Pyth update fee for price feed updates
+     * @param _fee The new fee in wei
      */
-    function addFundsERC20(IERC20 token, uint256 amount) external onlyOwner {
-        // Transfer tokens from owner to this contract
-        bool success = token.transferFrom(msg.sender, address(this), amount);
-        if (!success) {
-            revert TransferFailed();
-        }
-
-        ownerTokenDeposits[msg.sender][token] += amount;
-        emit FundsAddedToken(msg.sender, address(token), amount);
+    function setPythUpdateFee(uint256 _fee) external onlyOwner {
+        pythUpdateFee = _fee;
     }
 
     /**
-     * @notice Withdraws ERC20 tokens from the contract.
-     * @param token The ERC20 token to withdraw.
-     * @param amount The amount of tokens to withdraw.
-     * @dev Only the owner can withdraw ERC20 funds.
+     * @notice Updates the price tier configuration
+     * @param _highTierPrice_perBytePerEpoch The highest price tier (per byte per epoch)
+     * @param _midTierPrice_perBytePerEpoch The middle price tier (per byte per epoch)
+     * @param _lowTierPrice_perBytePerEpoch The lowest price tier (per byte per epoch)
      */
-    function withdrawFundsERC20(
-        IERC20 token,
-        uint256 amount
+    function updatePriceTier(
+        uint256 _highTierPrice_perBytePerEpoch,
+        uint256 _midTierPrice_perBytePerEpoch,
+        uint256 _lowTierPrice_perBytePerEpoch
     ) external onlyOwner {
-        if (ownerTokenDeposits[msg.sender][token] < amount) {
-            revert InsufficientBalance();
+        priceTier.highTierPrice_perBytePerEpoch = _highTierPrice_perBytePerEpoch;
+        priceTier.midTierPrice_perBytePerEpoch = _midTierPrice_perBytePerEpoch;
+        priceTier.lowTierPrice_perBytePerEpoch = _lowTierPrice_perBytePerEpoch;
+        
+        emit PriceTierUpdated(
+            _highTierPrice_perBytePerEpoch,
+            _midTierPrice_perBytePerEpoch,
+            _lowTierPrice_perBytePerEpoch
+        );
+    }
+
+    /**
+     * @notice Updates the price threshold configuration
+     * @param _highThreshold The high threshold for FIL price (in USD with precision)
+     * @param _lowThreshold The low threshold for FIL price (in USD with precision)
+     * @param _decimals The decimals for price representation
+     */
+    function updatePriceThreshold(
+        uint256 _highThreshold,
+        uint256 _lowThreshold,
+        uint32 _decimals
+    ) external onlyOwner {
+        require(_highThreshold > _lowThreshold, "High threshold must be greater than low threshold");
+        
+        priceThreshold.highThreshold = _highThreshold;
+        priceThreshold.lowThreshold = _lowThreshold;
+        priceThreshold.decimals = _decimals;
+        
+        emit PriceThresholdUpdated(
+            _highThreshold,
+            _lowThreshold,
+            _decimals
+        );
+    }
+
+    /**
+     * @notice Calculate price per byte per epoch based on FIL price
+     * @param filPrice The FIL price in USD with priceThreshold.decimals decimals
+     * @return Price per byte per epoch in wei
+     */
+    function calculatePricePerBytePerEpoch(uint256 filPrice) public view returns (uint256) {
+        if (filPrice < priceThreshold.lowThreshold) {
+            // Price < low threshold: highest tier price
+            return priceTier.highTierPrice_perBytePerEpoch;
+        } else if (filPrice <= priceThreshold.highThreshold) {
+            // low threshold <= Price <= high threshold: mid tier price
+            return priceTier.midTierPrice_perBytePerEpoch;
+        } else {
+            // Price > high threshold: lowest tier price
+            return priceTier.lowTierPrice_perBytePerEpoch;
         }
-        ownerTokenDeposits[msg.sender][token] -= amount;
-        bool success = token.transfer(msg.sender, amount);
-        if (!success) {
-            revert TransferFailed();
+    }
+
+    /**
+     * @notice Get FIL price from Pyth oracle
+     * @param updateData The Pyth price update data
+     * @param publishTime The publish time for price data
+     * @return The FIL price in USD (with priceThreshold.decimals precision)
+     */
+    function getFilPrice(bytes[] calldata updateData, uint64 publishTime) public payable returns (uint256) {
+        return priceFeed.getPrice{value: pythUpdateFee}(updateData, publishTime, priceThreshold.decimals);
+    }
+
+    /**
+     * @notice Allows the Storage Provider to withdraw all pending funds using the new structure
+     * @param actorId The actor ID of the Storage Provider
+     */
+    function withdrawSpFundsByProvider(uint64 actorId) external {
+        CommonTypes.FilAddress memory filAddr = FilAddresses.fromActorID(actorId);
+        
+        // Get the SP's payment data
+        SpPayment storage spPayment = spPayments[filAddr.data];
+        
+        // Calculate claimable amount in USD already with proper precision
+        uint256 claimableUSD = spPayment.totalAccrued - spPayment.totalWithdrawn;
+        
+        if (claimableUSD == 0) {
+            revert NoFundsToClaim();
         }
-        emit FundsWithdrawnToken(msg.sender, address(token), amount);
+
+        // Get FIL/USD price using the defined constants
+        uint256 filPriceInUSD = priceFeed.getPriceNotOlderThan(FIL_PRICE_MAX_AGE, FIL_PRICE_DECIMALS);
+        require(filPriceInUSD > 0, "Invalid FIL price");
+        
+        // Convert USD to FIL: claimableFIL = claimableUSD / filPriceInUSD
+        // Both values use exponent 18, so the result is in FIL with 18 decimals
+        uint256 claimableFIL = claimableUSD / filPriceInUSD;
+
+        if (address(this).balance < claimableFIL) {
+            revert ContractBalanceTooLow();
+        }
+
+        // Update withdrawal amount
+        spPayment.totalWithdrawn += claimableUSD;
+        
+        // Forward payment to SP in FIL
+        filForwarder.forward{value: claimableFIL}(filAddr.data);
+        
+        emit SpPaymentWithdrawn(0, msg.sender, claimableFIL);
+    }
+
+    /**
+     * @notice Updates the accrued payment for a Storage Provider
+     * @param actorId The actor ID of the Storage Provider
+     * @param updateData The Pyth price update data for all epochs obtained from getPublishTimes()
+     * @param publishTimes The publish times for each price updates
+     * @param updateTillEpoch The epoch until which to update payments (0 means current epoch)
+     * @return The total accrued payment for the Storage Provider
+     */
+    function updateSpAccruedPayment(
+        uint64 actorId,
+        bytes[] calldata updateData,
+        uint64[] calldata publishTimes,
+        uint256 updateTillEpoch
+    ) public payable returns (uint256) {
+        // Convert actorId to FilAddress
+        CommonTypes.FilAddress memory filAddr = FilAddresses.fromActorID(actorId);
+        bytes memory providerAddr = filAddr.data;
+        
+        // Get SP payment data
+        SpPayment storage spPayment = spPayments[providerAddr];
+        
+        // Initial validations
+        if (spPayment.nextCalcEpoch == 0) {
+            return 0;
+        }
+        
+        uint256 effectiveUpdateTillEpoch = updateTillEpoch == 0 ? getCurrentEpoch() : updateTillEpoch;
+        require(effectiveUpdateTillEpoch <= getCurrentEpoch(), "updateTillEpoch must be in the past");
+        
+        if (effectiveUpdateTillEpoch < spPayment.nextCalcEpoch) {
+            return 0;
+        }
+        
+        // Calculate days
+        uint256 startDay = spPayment.nextCalcEpoch / EPOCHS_PER_DAY;
+        uint256 endDay = effectiveUpdateTillEpoch / EPOCHS_PER_DAY;
+        
+        // Validate inputs
+        require(publishTimes.length == endDay - startDay + 1, "Incorrect number of publish times");
+        require(updateData.length > 0, "Update data required");
+        
+        // Process payment calculations
+        uint256 totalAccrued = processPaymentsByDay(
+            providerAddr,
+            startDay,
+            endDay,
+            spPayment.nextCalcEpoch,
+            effectiveUpdateTillEpoch,
+            updateData,
+            publishTimes
+        );
+        
+        // Update state
+        spPayment.totalAccrued += totalAccrued;
+        spPayment.nextCalcEpoch = effectiveUpdateTillEpoch + 1;
+        
+        return totalAccrued;
+    }
+
+    // Helper function to process payments day by day
+    function processPaymentsByDay(
+        bytes memory providerAddr,
+        uint256 startDay,
+        uint256 endDay,
+        uint256 startEpoch,
+        uint256 endEpoch,
+        bytes[] calldata updateData,
+        uint64[] calldata publishTimes
+    ) private returns (uint256) {
+        uint256 totalAccrued = 0;
+        uint64[] memory dealIds = spToDealIds[providerAddr];
+        
+        // Process each day
+        for (uint256 dayIndex = 0; dayIndex <= endDay - startDay; dayIndex++) {
+            totalAccrued += calculateDailyPayment(
+                dealIds,
+                startDay,
+                endDay,
+                dayIndex,
+                startEpoch,
+                endEpoch,
+                updateData[dayIndex],
+                publishTimes[dayIndex]
+            );
+        }
+        
+        return totalAccrued;
+    }
+
+    // Calculate payment for a single day
+    function calculateDailyPayment(
+        uint64[] memory dealIds,
+        uint256 startDay,
+        uint256 endDay,
+        uint256 dayIndex,
+        uint256 startEpoch,
+        uint256 endEpoch,
+        bytes calldata priceUpdateData,
+        uint64 publishTime
+    ) private returns (uint256) {
+        uint256 currentDay = startDay + dayIndex;
+        uint256 dayStartEpoch = currentDay * EPOCHS_PER_DAY;
+        uint256 dayEndEpoch = dayStartEpoch + EPOCHS_PER_DAY - 1;
+        
+        // Adjust boundaries
+        uint256 effectiveStartEpoch = (currentDay == startDay) ? startEpoch : dayStartEpoch;
+        uint256 effectiveEndEpoch = (currentDay == endDay) ? endEpoch : dayEndEpoch;
+        
+        // Skip if no epochs in this day
+        if (effectiveEndEpoch < effectiveStartEpoch) {
+            return 0;
+        }
+        
+        // Create array for price update and get price
+        bytes[] memory updateDataArray = new bytes[](1);
+        updateDataArray[0] = priceUpdateData;
+        uint256 filPrice = priceFeed.getPrice{value: pythUpdateFee}(updateDataArray, publishTime, priceThreshold.decimals);
+        uint256 pricePerBytePerEpoch = calculatePricePerBytePerEpoch(filPrice);
+        
+        // Calculate total size from active deals
+        uint256 totalPieceSize = getTotalPieceSizeForDay(dealIds, effectiveStartEpoch, effectiveEndEpoch);
+        
+        if (totalPieceSize == 0) {
+            return 0;
+        }
+        
+        // Calculate payment
+        uint256 epochsInDay = effectiveEndEpoch - effectiveStartEpoch + 1;
+        return pricePerBytePerEpoch * totalPieceSize * epochsInDay;
+    }
+
+    // Get total piece size from active deals for a day
+    function getTotalPieceSizeForDay(
+        uint64[] memory dealIds,
+        uint256 effectiveStartEpoch,
+        uint256 effectiveEndEpoch
+    ) private view returns (uint256) {
+        uint256 totalPieceSize = 0;
+        
+        for (uint256 i = 0; i < dealIds.length; i++) {
+            uint64 dealId = dealIds[i];
+            
+            // Check deal activation
+            (int256 exitCode, MarketTypes.GetDealActivationReturn memory activation) = 
+                MarketAPI.getDealActivation(dealId);
+            
+            // Skip terminated deals
+            if (exitCode != 0 || (
+                CommonTypes.ChainEpoch.unwrap(activation.terminated) != 0 && 
+                uint256(int256(CommonTypes.ChainEpoch.unwrap(activation.terminated))) < effectiveStartEpoch
+            )) {
+                continue;
+            }
+            
+            // Get deal data
+            (, MarketTypes.GetDealDataCommitmentReturn memory dealData) = 
+                MarketAPI.getDealDataCommitment(dealId);
+            
+            // Get deal terms
+            (, MarketTypes.GetDealTermReturn memory dealTerm) = 
+                MarketAPI.getDealTerm(dealId);
+            
+            // Calculate deal epochs
+            uint256 dealStartEpoch = uint256(int256(CommonTypes.ChainEpoch.unwrap(dealTerm.start)));
+            uint256 dealEndEpoch = dealStartEpoch + uint256(int256(CommonTypes.ChainEpoch.unwrap(dealTerm.duration)));
+            
+            // Apply termination if applicable
+            if (CommonTypes.ChainEpoch.unwrap(activation.terminated) != 0) {
+                dealEndEpoch = uint256(int256(CommonTypes.ChainEpoch.unwrap(activation.terminated)));
+            }
+            
+            // Check if deal is active in this period
+            if (dealStartEpoch > effectiveEndEpoch || dealEndEpoch < effectiveStartEpoch) {
+                continue;
+            }
+            
+            // Add piece size
+            // This means we are paying for whole day even if deal is active only for part of it
+            totalPieceSize += uint256(dealData.size);
+        }
+        
+        return totalPieceSize;
     }
 
     /**
@@ -425,185 +677,6 @@ contract MarketDealWrapper is Ownable {
      */
     function getCurrentEpoch() public view returns (uint256) {
         return block.number;
-    }
-
-    /**
-     * @notice Returns the currently claimable amount for a given deal.
-     * @param dealId The dealId to get funds for.
-     * @return The amount claimable by the Storage Provider.
-     */
-    function getSpFundsForDeal(uint64 dealId) public view returns (uint256) {
-        (
-            int256 exitCode,
-            MarketTypes.GetDealActivationReturn memory result
-        ) = MarketAPI.getDealActivation(dealId);
-
-        if (
-            exitCode != 0 ||
-            CommonTypes.ChainEpoch.unwrap(result.terminated) != 0
-        ) {
-            return 0;
-        }
-        DealPayment memory dp = dealPayments[dealId];
-        uint256 current = getCurrentEpoch();
-        if (current < dp.startEpoch) {
-            return 0;
-        }
-        if (current > dp.endEpoch) {
-            current = dp.endEpoch;
-        }
-        uint256 totalVested = dp.pricePerEpoch * (current - dp.startEpoch);
-        return totalVested - dp.withdrawn;
-    }
-
-    /**
-     * @notice Allows the Storage Provider to withdraw funds for a specific deal.
-     * @param dealId The dealId to withdraw funds for.
-     * @dev Funds are vested as per epoch.
-     */
-    function withdrawSpFundsForDeal(uint64 dealId) external {
-        DealPayment storage s_dp = dealPayments[dealId];
-        DealPayment memory dp = s_dp;
-        if (msg.sender != dp.sp) {
-            revert NotStorageProvider();
-        }
-        uint256 claimable = getSpFundsForDeal(dealId);
-        if (claimable == 0) {
-            revert NoFundsToClaim();
-        }
-        s_dp.withdrawn += claimable;
-
-        if (address(dp.token) == address(0)) {
-            if (address(this).balance < claimable) {
-                revert ContractBalanceTooLow();
-            }
-            (bool sent, ) = msg.sender.call{value: claimable}("");
-            if (!sent) {
-                revert TransferFailed();
-            }
-        } else {
-            bool success = dp.token.transfer(msg.sender, claimable);
-            if (!success) {
-                revert TransferFailed();
-            }
-        }
-
-        emit SpPaymentWithdrawn(dealId, msg.sender, claimable);
-    }
-
-    /**
-     * @notice Allows the Storage Provider to withdraw all funds by ERC20 token.
-     * @param token The ERC20 token to withdraw.
-     */
-    function withdrawSpFundsByToken(IERC20 token) external {
-        uint64[] memory deals = spToDealIds[msg.sender];
-        uint256 totalClaimable;
-        uint256 dealCount = deals.length;
-
-        for (uint256 i = 0; i < dealCount; i++) {
-            uint64 dealId = deals[i];
-            DealPayment memory dp = dealPayments[dealId];
-            if (dp.sp != msg.sender) {
-                continue;
-            }
-            if (address(dp.token) != address(token)) {
-                continue;
-            }
-            DealPayment storage s_dp = dealPayments[dealId];
-            uint256 claimable = getSpFundsForDeal(dealId);
-            if (claimable > 0) {
-                s_dp.withdrawn += claimable;
-                totalClaimable += claimable;
-            }
-        }
-
-        if (totalClaimable == 0) {
-            revert NoFundsToClaim();
-        }
-
-        if (address(token) == address(0)) {
-            // Native coin
-            if (address(this).balance < totalClaimable) {
-                revert ContractBalanceTooLow();
-            }
-            (bool sent, ) = msg.sender.call{value: totalClaimable}("");
-            if (!sent) {
-                revert TransferFailed();
-            }
-        } else {
-            bool success = token.transfer(msg.sender, totalClaimable);
-            if (!success) {
-                revert TransferFailed();
-            }
-        }
-
-        // Emit one aggregated event
-        emit SpPaymentWithdrawnToken(
-            msg.sender,
-            address(token),
-            totalClaimable
-        );
-    }
-
-    /**
-     * @notice Allows the Storage Provider to withdraw partial funds for a terminated deal.
-     * @param dealId The dealId of the terminated deal.
-     */
-    function withdrawSpFundsForTerminatedDeal(uint64 dealId) external {
-        (
-            int256 exitCode,
-            MarketTypes.GetDealActivationReturn memory result
-        ) = MarketAPI.getDealActivation(dealId);
-        if (
-            exitCode != 0 ||
-            CommonTypes.ChainEpoch.unwrap(result.terminated) == 0
-        ) {
-            revert("Deal not terminated or not found");
-        }
-
-        DealPayment storage s_dp = dealPayments[dealId];
-        DealPayment memory dp = s_dp;
-        if (msg.sender != dp.sp) {
-            revert NotStorageProvider();
-        }
-
-        dp.endEpoch = uint256(
-            int256(CommonTypes.ChainEpoch.unwrap(result.terminated))
-        );
-        s_dp.endEpoch = dp.endEpoch;
-
-        if (msg.sender != dp.sp) {
-            revert NotStorageProvider();
-        }
-
-        uint256 current = getCurrentEpoch();
-        if (current > dp.endEpoch) {
-            current = dp.endEpoch;
-        }
-        uint256 totalVested = dp.pricePerEpoch * (current - dp.startEpoch);
-
-        uint256 claimable = totalVested - dp.withdrawn;
-        if (claimable == 0) {
-            revert NoFundsToClaim();
-        }
-        s_dp.withdrawn += claimable;
-
-        if (address(dp.token) == address(0)) {
-            if (address(this).balance < claimable) {
-                revert ContractBalanceTooLow();
-            }
-            (bool sent, ) = msg.sender.call{value: claimable}("");
-            if (!sent) {
-                revert TransferFailed();
-            }
-        } else {
-            bool success = dp.token.transfer(msg.sender, claimable);
-            if (!success) {
-                revert TransferFailed();
-            }
-        }
-
-        emit SpPaymentWithdrawn(dealId, msg.sender, claimable);
     }
 
     /**
@@ -619,57 +692,27 @@ contract MarketDealWrapper is Ownable {
             minerId
         );
 
-        // Get the StorageProvider using filAddr.data
-        StorageProvider memory sp = storageProviders[filAddr.data];
-
-        // Retrieve deal IDs from spToDealIds using sp.ethAddr
-        return spToDealIds[sp.ethAddr];
+        // Retrieve deal IDs from spToDealIds using filAddr.data
+        return spToDealIds[filAddr.data];
     }
 
     /**
-     * @notice Retrieves the currently claimable SP funds for a specific ERC20 token and actor ID.
-     * @param token The ERC20 token.
+     * @notice Retrieves the total claimable native funds for a Storage Provider across all their deals.
      * @param actorId The actor ID of the Storage Provider.
      * @return The total claimable funds.
      */
-    function getTokenFundsForSp(
-        IERC20 token,
-        uint64 actorId
-    ) public view returns (uint256) {
-        address spAddr = getSpFromId(actorId).ethAddr;
-        uint64[] memory deals = spToDealIds[spAddr];
-        uint256 totalClaimable;
-        uint256 dealCount = deals.length;
-
-        for (uint256 i = 0; i < dealCount; i++) {
-            uint64 dealId = deals[i];
-            DealPayment memory dp = dealPayments[dealId];
-            if (dp.sp != spAddr) {
-                continue;
-            }
-            if (address(dp.token) != address(token)) {
-                continue;
-            }
-            uint256 claimable = getSpFundsForDeal(dealId);
-            totalClaimable += claimable;
-        }
+    function getSpFunds(uint64 actorId) public view returns (uint256) {
+        // Get FilAddress from actorId
+        CommonTypes.FilAddress memory filAddr = FilAddresses.fromActorID(actorId);
+        bytes memory providerAddr = filAddr.data;
+        // Retrieve payment data for the Storage Provider
+        SpPayment storage spPayment = spPayments[providerAddr];
+        // Calculate the total claimable amount
+        uint256 totalClaimable = spPayment.totalAccrued - spPayment.totalWithdrawn;
 
         return totalClaimable;
     }
 
-    /**
-     * @notice Retrieves the Storage Provider details from an actor ID.
-     * @param actorId The actor ID of the Storage Provider.
-     * @return The StorageProvider struct.
-     */
-    function getSpFromId(
-        uint64 actorId
-    ) public view returns (StorageProvider memory) {
-        CommonTypes.FilAddress memory filAddr = FilAddresses.fromActorID(
-            actorId
-        );
-        return storageProviders[filAddr.data];
-    }
 
     /**
      * @notice Converts an address to its hexadecimal string representation.
@@ -776,6 +819,55 @@ contract MarketDealWrapper is Ownable {
         }
     }
 
+
+    /**
+     * @notice Calculate the necessary publish times for price updates 
+     * @param providerAddr The FilAddress bytes of the Storage Provider
+     * @param updateTillEpoch The epoch until which to update (current epoch if 0)
+     * @return Array of UTC timestamps (in seconds) for which price updates are needed
+     */
+    function GetPublishTimes(
+        bytes memory providerAddr,
+        uint256 updateTillEpoch
+    ) public view returns (uint64[] memory) {
+        SpPayment storage spPayment = spPayments[providerAddr];
+        
+        // If no payment info or nextCalcEpoch is 0, return empty array
+        if (spPayment.nextCalcEpoch == 0) {
+            return new uint64[](0);
+        }
+        
+        // If updateTillEpoch is 0, use current epoch
+        if (updateTillEpoch == 0) {
+            updateTillEpoch = getCurrentEpoch();
+        }
+        
+        // Calculate how many days we need to cover
+        uint256 startDay = spPayment.nextCalcEpoch / EPOCHS_PER_DAY;
+        uint256 endDay = updateTillEpoch / EPOCHS_PER_DAY;
+        
+        // If endDay is before startDay, return empty array
+        if (endDay < startDay) {
+            return new uint64[](0);
+        }
+        
+        // Number of publish times is the number of days
+        uint256 numPublishTimes = endDay - startDay + 1;
+        uint64[] memory publishTimes = new uint64[](numPublishTimes);
+        
+        // Set publish time for each day at noon UTC (timestamp is in seconds)
+        for (uint256 i = 0; i < numPublishTimes; i++) {
+            // Convert filecoin epoch to timestamp
+            // Assuming each epoch is 30 seconds
+            uint256 dayStartEpoch = (startDay + i) * EPOCHS_PER_DAY;
+
+            // Convert to timestamp (epoch number * 30 seconds)
+            publishTimes[i] = uint64(dayStartEpoch * 30);
+        }
+        
+        return publishTimes;
+    }
+
     /**
      * @notice Fallback function to receive Ether.
      */
@@ -785,4 +877,31 @@ contract MarketDealWrapper is Ownable {
      * @notice Fallback function.
      */
     fallback() external payable {}
+
+    // functions for testing
+    /**
+     * @notice Set the payment data for a Storage Provider
+     * @param providerAddr The FilAddress bytes of the Storage Provider
+     * @param totalAccrued The total amount accrued to the Storage Provider
+     * @param totalWithdrawn The total amount withdrawn by the Storage Provider
+     * @param nextCalcEpoch The next epoch to calculate payment from
+     */
+    function setSpayment(
+        bytes memory providerAddr,
+        uint256 totalAccrued,
+        uint256 totalWithdrawn,
+        uint256 nextCalcEpoch
+    ) external onlyOwner {
+        SpPayment storage spPayment = spPayments[providerAddr];
+        spPayment.totalAccrued = totalAccrued;
+        spPayment.totalWithdrawn = totalWithdrawn;
+        spPayment.nextCalcEpoch = nextCalcEpoch;
+    }
+
+    function setSpDealIds(
+        bytes memory providerAddr,
+        uint64[] memory dealIds
+    ) external onlyOwner {
+        spToDealIds[providerAddr] = dealIds;
+    }
 }
